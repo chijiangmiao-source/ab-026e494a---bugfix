@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.venv/
+node_modules/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.npm-cache/
+.pnpm-store/
+.yarn-cache/
+*.pyc
+*.pyo

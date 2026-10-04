@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>高空探测器标定包发布控制台</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 980px; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; }
+  h2 { font-size: 1.05rem; margin-top: 0; }
+  section { border: 1px solid #8884; border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 1.25rem; }
+  label { display: block; margin: .5rem 0 .25rem; font-weight: 600; }
+  input[type=text], textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; padding: .4rem; }
+  button { margin-top: .6rem; padding: .45rem 1.2rem; cursor: pointer; }
+  #feedback { margin-top: .7rem; padding: .6rem .8rem; border-radius: 6px; display: none; white-space: pre-wrap; }
+  #feedback.ok { display: block; background: #0a72303a; color: #1c9c4c; }
+  #feedback.err { display: block; background: #a3252533; color: #d05050; }
+  table { border-collapse: collapse; width: 100%; margin-top: .6rem; font-size: .88rem; }
+  th, td { border: 1px solid #8884; padding: .3rem .5rem; text-align: left; }
+  code { font-family: ui-monospace, monospace; }
+  .mono { font-family: ui-monospace, monospace; font-size: .78rem; word-break: break-all; }
+  .state-COMPLETED { color: #1c9c4c; font-weight: 700; }
+  .state-REJECTED { color: #d05050; font-weight: 700; }
+  .state-PENDING, .state-PREPARING, .state-ACTIVATING { color: #c08a00; font-weight: 700; }
+</style>
+</head>
+<body>
+<h1>高空探测器标定包发布控制台</h1>
+
+<section>
+  <h2>发布标定包（同一候选字节切换至两座离线镜像仓）</h2>
+  <label for="rid">发布标识</label>
+  <input type="text" id="rid" maxlength="128" placeholder="例如 cal-2026-10-04-001">
+  <label for="artifact">Base64 工件（解码后 ≤ 64KiB）</label>
+  <textarea id="artifact" rows="8" spellcheck="false" placeholder="粘贴 Base64 编码的标定包"></textarea>
+  <div class="mono" id="sizehint"></div>
+  <button id="publish">发布到双镜像仓</button>
+  <div id="feedback" role="alert"></div>
+</section>
+
+<section>
+  <h2>按标识查询（进度 / 当前摘要 / 准备与激活证据）</h2>
+  <label for="qid">发布标识</label>
+  <input type="text" id="qid">
+  <button id="query">查询</button>
+  <div id="detail"></div>
+</section>
+
+<section>
+  <h2>全部发布</h2>
+  <div id="list">加载中…</div>
+</section>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const short = (s) => s ? String(s).slice(0, 16) + "…" : "—";
+
+async function api(method, url, body) {
+  const opt = { method, headers: {} };
+  if (body !== undefined) {
+    opt.headers["Content-Type"] = "application/json";
+    opt.body = JSON.stringify(body);
+  }
+  const resp = await fetch(url, opt);
+  let json = {};
+  try { json = await resp.json(); } catch (e) {}
+  return { status: resp.status, body: json };
+}
+
+function feedback(kind, msg) {
+  const el = $("feedback");
+  el.className = kind;
+  el.textContent = msg;
+}
+
+$("artifact").addEventListener("input", () => {
+  const compact = $("artifact").value.replace(/\s+/g, "");
+  const bytes = Math.floor(compact.length * 3 / 4);
+  $("sizehint").textContent = compact
+    ? `估算解码大小 ≈ ${bytes} 字节（上限 65536 字节）`
+    : "";
+});
+
+$("publish").addEventListener("click", async () => {
+  const rid = $("rid").value.trim();
+  const b64 = $("artifact").value.trim();
+  if (!rid) { feedback("err", "请输入发布标识"); return; }
+  if (!b64) { feedback("err", "请输入 Base64 工件"); return; }
+  try {
+    const { status, body } = await api("POST", "/api/releases",
+      { release_id: rid, artifact_b64: b64 });
+    if (status === 202) {
+      feedback("ok", `已受理发布 ${rid}\nSHA-256：${body.sha256}\n状态：${body.state}`);
+    } else if (status === 200) {
+      feedback("ok", `发布 ${rid} 已存在（相同工件，幂等回放，不会重复激活）\n当前状态：${body.state}`);
+    } else {
+      feedback("err", (body.error && body.error.message) || `请求失败（HTTP ${status}）`);
+    }
+    $("qid").value = rid;
+    query();
+    refreshList();
+  } catch (e) {
+    feedback("err", "网络错误：" + e);
+  }
+});
+
+function receiptRow(repo, op, r) {
+  if (!r) return `<tr><td>${repo}</td><td>${op}</td><td colspan="4">—</td></tr>`;
+  return `<tr><td>${repo}</td><td>${op}</td><td class="mono">${short(r.digest)}</td>` +
+    `<td class="mono">${short(r.receipt_id)}</td><td>${r.ts || ""}</td>` +
+    `<td>${r.sig ? "✓" : "—"}</td></tr>`;
+}
+
+async function query() {
+  const rid = $("qid").value.trim();
+  if (!rid) { $("detail").innerHTML = ""; return; }
+  const { status, body } = await api("GET", "/api/releases/" + encodeURIComponent(rid));
+  if (status !== 200) {
+    $("detail").innerHTML = `<p>${(body.error && body.error.message) || "查询失败"}</p>`;
+    return;
+  }
+  let html = `<p>状态：<span class="state-${body.state}">${body.state}</span><br>` +
+    `SHA-256：<code>${body.sha256}</code><br>` +
+    `当前摘要：<code>${body.current_digest || "—"}</code><br>` +
+    (body.error ? `错误：<code>${body.error}</code><br>` : "") +
+    `大小：${body.size} 字节</p>`;
+  html += `<table><tr><th>镜像仓</th><th>操作</th><th>摘要</th><th>回执 ID</th>` +
+    `<th>时间</th><th>签名</th></tr>`;
+  for (const repo of Object.keys(body.repos)) {
+    html += receiptRow(repo, "prepare", body.repos[repo].prepare);
+    html += receiptRow(repo, "activate", body.repos[repo].activate);
+  }
+  html += "</table>";
+  $("detail").innerHTML = html;
+}
+
+$("query").addEventListener("click", query);
+
+async function refreshList() {
+  const { body } = await api("GET", "/api/releases");
+  const rows = (body.releases || []).map(r =>
+    `<tr><td class="mono">${r.release_id}</td><td class="mono">${short(r.sha256)}</td>` +
+    `<td class="state-${r.state}">${r.state}</td><td>${r.size}</td>` +
+    `<td>${r.updated_at}</td></tr>`).join("");
+  $("list").innerHTML = rows
+    ? `<table><tr><th>发布标识</th><th>SHA-256</th><th>状态</th><th>大小</th>` +
+      `<th>更新时间</th></tr>${rows}</table>`
+    : "<p>暂无发布</p>";
+}
+
+refreshList();
+setInterval(refreshList, 3000);
+setInterval(() => { if ($("qid").value.trim()) query(); }, 3000);
+</script>
+</body>
+</html>

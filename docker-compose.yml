@@ -1,0 +1,96 @@
+name: calibration-release
+
+# 高空探测器标定包发布系统：
+#   control  —— 控制台 + 发布编排（先持久化意图，再驱动双仓准备/激活）
+#   repo-a / repo-b —— 两座离线镜像仓（仓端操作键幂等，回执即证据）
+#   verify   —— 一次性验收服务，执行后退出，退出码即验收结果
+
+services:
+  control:
+    build: .
+    command: ["python", "-m", "app.control.server"]
+    environment:
+      PORT: "8080"
+      DATA_DIR: /data
+      REPO_A_URL: http://repo-a:8001
+      REPO_B_URL: http://repo-b:8002
+      REPO_A_SECRET: ${REPO_A_SECRET:-dev-secret-a}
+      REPO_B_SECRET: ${REPO_B_SECRET:-dev-secret-b}
+      WORKER_INTERVAL_S: "0.5"
+      FAULT_HOOKS: "1"          # 验收环境开启故障注入；生产应置 0
+    ports:
+      - "${CONTROL_PORT:-8080}:8080"   # 可配置宿主机端口
+    volumes:
+      - control-data:/data
+    depends_on:
+      repo-a:
+        condition: service_healthy
+      repo-b:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: on-failure
+
+  repo-a:
+    build: .
+    command: ["python", "-m", "app.repo.server"]
+    environment:
+      REPO_NAME: repo-a
+      PORT: "8001"
+      DATA_DIR: /data
+      REPO_SECRET: ${REPO_A_SECRET:-dev-secret-a}
+      FAULT_HOOKS: "1"
+    volumes:
+      - repo-a-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: on-failure
+
+  repo-b:
+    build: .
+    command: ["python", "-m", "app.repo.server"]
+    environment:
+      REPO_NAME: repo-b
+      PORT: "8002"
+      DATA_DIR: /data
+      REPO_SECRET: ${REPO_B_SECRET:-dev-secret-b}
+      FAULT_HOOKS: "1"
+    volumes:
+      - repo-b-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: on-failure
+
+  verify:
+    build: .
+    command: ["python", "-m", "app.verify.verify"]
+    environment:
+      CONTROL_URL: http://control:8080
+      REPO_A_URL: http://repo-a:8001
+      REPO_B_URL: http://repo-b:8002
+      SRC_DIR: /srv
+    depends_on:
+      control:
+        condition: service_healthy
+      repo-a:
+        condition: service_healthy
+      repo-b:
+        condition: service_healthy
+    restart: "no"   # 一次性服务：执行后退出，退出码即验收结果
+
+volumes:
+  control-data:
+  repo-a-data:
+  repo-b-data:
