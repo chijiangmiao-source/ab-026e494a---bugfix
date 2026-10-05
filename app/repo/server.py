@@ -83,6 +83,18 @@ def build_app(core: RepoCore, fault_hooks: bool = False) -> App:
             raise ApiError(503, "disconnected", "镜像仓已断开响应")
         return (201 if created else 200), {"receipt": receipt}
 
+    @app.route("POST", "/v1/activate/rollback")
+    def rollback_activate(req):
+        guard()
+        body = req.json()
+        op_key = body.get("op_key")
+        if not (isinstance(op_key, str) and op_key):
+            raise ApiError(400, "bad_request", "op_key 为必填字符串")
+        found = core.rollback_activate(op_key)
+        if not found:
+            raise ApiError(404, "not_found", "该操作键不存在或并非激活操作")
+        return {"rolled_back": True, "op_key": op_key}
+
     @app.route("GET", "/v1/ops/{op_key}")
     def get_op(req):
         guard()

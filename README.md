@@ -46,8 +46,10 @@ CONTROL_PORT=9090 docker compose up --build -d control repo-a repo-b
 - **断连收敛**：若一仓在持久化激活后断开响应，控制服务重启后会先向仓端
   `GET /v1/ops/{op_key}` 认领既有回执，依据仓端回执收敛为完成，绝不二次激活。
 - **拒绝锁定**：任一仓返回不属于该发布的摘要（或证据签名不符、操作键冲突）时，
-  发布锁定为 `REJECTED`，`current_digest` 保持为空，仓端活动指针不被改写，
-  且状态不再漂移。
+  控制服务先收齐两仓的激活结果，把已经切到候选摘要的其它仓**幂等回滚**到该仓
+  发布前的活动指针（全新仓即回滚为 `null`），再把发布锁定为 `REJECTED`：
+  `current_digest` 保持为空，两座仓的活动指针都不遗留被拒绝的候选摘要，
+  回滚未确认前状态停留在 `ACTIVATING`（崩溃/重启后继续收敛），锁定后状态不再漂移。
 - **幂等提交**：相同标识 + 相同工件 → `200` 回放当前状态，不产生第二次激活；
   相同标识 + 不同工件 → `409 release_id_in_use`，既有成功发布的真实状态保留；
   非法 Base64 → `400 invalid_base64`；超限工件 → `413 artifact_too_large`
@@ -64,7 +66,10 @@ CONTROL_PORT=9090 docker compose up --build -d control repo-a repo-b
 | GET | `/api/releases` | 全部发布列表 |
 
 仓端（仅内部网络）：`POST /v1/prepare`、`POST /v1/activate`、
-`GET /v1/ops/{op_key}`、`GET /v1/state`、`GET /healthz`。
+`POST /v1/activate/rollback`、`GET /v1/ops/{op_key}`、`GET /v1/state`、`GET /healthz`。
+
+激活时仓端会持久化该次激活**之前**的活动指针；`rollback` 按激活操作键幂等恢复
+旧指针（含恢复为 `null`），且不会覆盖更新发布已写入的新指针。
 
 ## verify 验收服务
 

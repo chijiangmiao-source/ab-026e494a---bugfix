@@ -264,6 +264,8 @@ def phase_smoke(rid: str, artifact: bytes, sha: str):
     # Rejection: a repo returns a digest that does not belong to the release.
     rid3 = f"{rid}-rej"
     art3 = f"rejection-probe:{rid3}".encode()
+    sha3 = sha256_hex(art3)
+    a_state_before = repo_state(REPO_A_URL)
     b_state_before = repo_state(REPO_B_URL)
     s, _ = http_json("POST", f"{REPO_B_URL}/fault/corrupt-next-activate", {}, timeout=5)
     check("arm repo-b corrupt-next-activate", s == 200, f"status={s}")
@@ -280,12 +282,25 @@ def phase_smoke(rid: str, artifact: bytes, sha: str):
     check("rejection reason recorded", bool(d3.get("error")), f"error={d3.get('error')}")
     check("rejected release exposes no current digest",
           d3.get("current_digest") is None, f"current={d3.get('current_digest')}")
+    a_state_after = repo_state(REPO_A_URL)
     b_state_after = repo_state(REPO_B_URL)
+    # repo-b never switched; repo-a switched but MUST be rolled back to its
+    # pre-release pointer -- the rejected artifact must never stay active.
     check("repo-b active pointer NOT rewritten",
           b_state_after.get("active_digest") == b_state_before.get("active_digest"),
           f"active={b_state_after.get('active_digest')}")
     check("repo-b did not register an activation for the rejected release",
           b_state_after.get("activation_count") == b_state_before.get("activation_count"))
+    check("repo-a active pointer rolled back to its pre-release value",
+          a_state_after.get("active_digest") == a_state_before.get("active_digest"),
+          f"active={a_state_after.get('active_digest')}")
+    check("repo-a did not keep an activation for the rejected release",
+          a_state_after.get("activation_count") == a_state_before.get("activation_count"),
+          f"count={a_state_after.get('activation_count')}")
+    check("rejected artifact is active on NEITHER repo",
+          a_state_after.get("active_digest") != sha3
+          and b_state_after.get("active_digest") != sha3,
+          f"a={a_state_after.get('active_digest')} b={b_state_after.get('active_digest')}")
     time.sleep(3)
     s, b = get_release(rid3)
     check("rejection is locked (state does not drift)", b.get("state") == "REJECTED",
@@ -296,7 +311,8 @@ def phase_smoke(rid: str, artifact: bytes, sha: str):
     check("resubmission of a rejected release does not unlock it",
           s == 200 and b.get("state") == "REJECTED", f"status={s} state={b.get('state')}")
     check("still no activation after resubmission",
-          repo_state(REPO_B_URL)["activation_count"] == b_state_before["activation_count"])
+          repo_state(REPO_A_URL)["activation_count"] == a_state_before["activation_count"]
+          and repo_state(REPO_B_URL)["activation_count"] == b_state_before["activation_count"])
 
     # Repo-level idempotency, exercised directly against repo-a.
     ts = int(time.time())

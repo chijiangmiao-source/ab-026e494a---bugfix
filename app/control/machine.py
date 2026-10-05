@@ -5,6 +5,14 @@ every repo receipt is persisted locally as soon as it is observed. Before
 issuing an operation the machine first asks the repo for an existing receipt
 under the derived op key, so a control-service restart converges from
 repo-side receipts without ever re-executing an operation.
+
+Rejection model: a release only becomes REJECTED once the activate outcome of
+EVERY repo has been gathered. When one repo reports a digest that does not
+belong to the release (or conflicting/invalid evidence), every other repo
+that had already flipped its live active pointer to the candidate digest is
+rolled back (durably and idempotently on the repo side) BEFORE the release
+locks. A rejected candidate therefore never remains active anywhere, and a
+crash mid-rollback simply resumes the rollback on the next worker tick.
 """
 from __future__ import annotations
 
@@ -21,6 +29,19 @@ log = logging.getLogger("control.machine")
 
 class Rejected(Exception):
     """Internal signal: the release has just been locked as REJECTED."""
+
+
+class _ReceiptBad(Exception):
+    """A repo's evidence conflicts with the release (bad sig / key conflict).
+
+    Carries a reason but does NOT terminalize the release itself: during the
+    activate phase all repos must be accounted for and any already-switched
+    active pointers rolled back before REJECTED is locked.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
 
 
 class ReleaseMachine:
@@ -46,31 +67,87 @@ class ReleaseMachine:
         artifact_b64 = base64.b64encode(rel["artifact"]).decode()
 
         # Phase 1: prepare both repos with the identical candidate bytes.
+        # A prepare never moves a live pointer, so conflicting evidence here
+        # can lock REJECTED immediately without any rollback.
         for repo in self.clients:
-            receipt = self._ensure_op(rid, repo, core.OP_PREPARE, sha, artifact_b64)
+            try:
+                receipt = self._ensure_op(rid, repo, core.OP_PREPARE, sha, artifact_b64)
+            except _ReceiptBad as bad:
+                self._reject(rid, bad.reason)
+                raise Rejected()
             if receipt is None:
                 self._set_state(rid, core.STATE_PREPARING)
                 return
-            self._check_digest(rid, repo, core.OP_PREPARE, sha, receipt)
+            if receipt.get("digest") != sha:
+                self._reject(
+                    rid,
+                    f"镜像仓 {repo} 的 prepare 回执摘要不属于本发布"
+                    f"（收到 {receipt.get('digest')}，期望 {sha}），发布已锁定为拒绝",
+                )
+                raise Rejected()
 
         self._set_state(rid, core.STATE_ACTIVATING)
 
-        # Phase 2: activate both repos; only identical digests may complete.
+        # Phase 2: gather the activate outcome of EVERY repo before deciding.
+        # A repo that already flipped its live pointer must be rolled back
+        # before REJECTED is locked, so the release stays ACTIVATING (and the
+        # worker retries after a restart) until rollback is confirmed.
+        receipts: dict[str, dict] = {}
+        bad_reason: str | None = None
         for repo in self.clients:
-            receipt = self._ensure_op(rid, repo, core.OP_ACTIVATE, sha, artifact_b64)
+            try:
+                receipt = self._ensure_op(rid, repo, core.OP_ACTIVATE, sha, artifact_b64)
+            except _ReceiptBad as bad:
+                bad_reason = bad.reason
+                continue
             if receipt is None:
-                return
-            self._check_digest(rid, repo, core.OP_ACTIVATE, sha, receipt)
+                return  # unreachable / transient: retry next tick
+            receipts[repo] = receipt
+            if receipt.get("digest") != sha and bad_reason is None:
+                bad_reason = (
+                    f"镜像仓 {repo} 的 activate 回执摘要不属于本发布"
+                    f"（收到 {receipt.get('digest')}，期望 {sha}），发布已锁定为拒绝"
+                )
+
+        if bad_reason is not None:
+            # Undo every activation that switched a pointer to THIS release's
+            # digest. Foreign-digest receipts never moved a pointer.
+            for repo, receipt in receipts.items():
+                if receipt.get("digest") == sha and not self._rollback(rid, repo):
+                    # Keep the release non-terminal; a later tick retries the
+                    # idempotent rollback and then locks the rejection.
+                    log.warning("rollback pending for release %s on repo %s", rid, repo)
+                    return
+            self._reject(rid, bad_reason)
+            raise Rejected()
 
         self._set_state(rid, core.STATE_COMPLETED)
         log.info("release %s completed (sha256=%s)", rid, sha)
+
+    def _rollback(self, rid: str, repo: str) -> bool:
+        """Ask a repo to undo the release's activation; idempotent on retry."""
+        key = core.op_key(rid, repo, core.OP_ACTIVATE)
+        try:
+            status, _ = self.clients[repo].rollback_activate(key)
+        except TransportError as e:
+            log.warning("repo %s rollback unreachable for %s: %s", repo, rid, e)
+            return False
+        if status in (200, 204):
+            log.info("repo %s rolled back activation %s", repo, key)
+            return True
+        if status == 404:
+            # Nothing committed under that key, so no live pointer to restore.
+            return True
+        log.warning("repo %s rollback for %s -> HTTP %s", repo, rid, status)
+        return False
 
     def _ensure_op(self, rid: str, repo: str, op: str, sha: str,
                    artifact_b64: str) -> dict | None:
         """Return the repo receipt for this op, persisting it locally.
 
         Returns None when the repo is unreachable (the worker retries later).
-        Raises Rejected when repo-side evidence conflicts with the release.
+        Raises _ReceiptBad when repo-side evidence conflicts with the release;
+        the caller decides when (and after which rollbacks) to lock REJECTED.
         """
         existing = self.store.get_receipt(rid, repo, op)
         if existing is not None:
@@ -90,7 +167,7 @@ class ReleaseMachine:
                 if status in (200, 201):
                     return self._adopt(rid, repo, op, key, body.get("receipt"))
                 if status == 409:
-                    self._reject_conflict(rid, repo, op, key, body)
+                    raise self._conflict(rid, repo, op, key, body)
                 if status == 400 and (body.get("error") or {}).get("code") == "not_prepared":
                     # Repo lost its staging area; re-prepare, retry next tick.
                     client.prepare(core.op_key(rid, repo, core.OP_PREPARE), sha, artifact_b64)
@@ -107,21 +184,13 @@ class ReleaseMachine:
             log.warning("repo %s returned an empty receipt for %s", repo, key)
             return None
         if not verify_receipt(self.secrets.get(repo, ""), receipt):
-            self._reject(rid, f"镜像仓 {repo} 的 {op} 证据签名校验失败，发布已锁定为拒绝")
-            raise Rejected()
+            raise _ReceiptBad(
+                f"镜像仓 {repo} 的 {op} 证据签名校验失败，发布将锁定为拒绝"
+            )
         self.store.put_receipt(rid, repo, op, key, str(receipt.get("digest", "")), receipt)
         return receipt
 
-    def _check_digest(self, rid: str, repo: str, op: str, sha: str, receipt: dict) -> None:
-        if receipt.get("digest") != sha:
-            self._reject(
-                rid,
-                f"镜像仓 {repo} 的 {op} 回执摘要不属于本发布"
-                f"（收到 {receipt.get('digest')}，期望 {sha}），发布已锁定为拒绝",
-            )
-            raise Rejected()
-
-    def _reject_conflict(self, rid: str, repo: str, op: str, key: str, body: dict) -> None:
+    def _conflict(self, rid: str, repo: str, op: str, key: str, body: dict) -> "_ReceiptBad":
         err = body.get("error") or {}
         existing = err.get("existing_digest", "<unknown>")
         # Best effort: keep the conflicting repo-side receipt as evidence.
@@ -135,8 +204,9 @@ class ReleaseMachine:
                     )
         except TransportError:
             pass
-        self._reject(rid, f"镜像仓 {repo} 拒绝了 {op}：操作键已绑定不同摘要（{existing}）")
-        raise Rejected()
+        return _ReceiptBad(
+            f"镜像仓 {repo} 拒绝了 {op}：操作键已绑定不同摘要（{existing}）"
+        )
 
     def _reject(self, rid: str, message: str) -> None:
         log.error("release %s rejected: %s", rid, message)

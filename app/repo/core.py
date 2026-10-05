@@ -16,11 +16,13 @@ from app.common.receipts import new_receipt, utcnow
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ops (
-  op_key     TEXT PRIMARY KEY,
-  op         TEXT NOT NULL,
-  digest     TEXT NOT NULL,
-  receipt    TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  op_key       TEXT PRIMARY KEY,
+  op           TEXT NOT NULL,
+  digest       TEXT NOT NULL,
+  receipt      TEXT NOT NULL,
+  created_at   TEXT NOT NULL,
+  prev_digest  TEXT,
+  rolled_back  INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS artifacts (
   digest TEXT PRIMARY KEY,
@@ -61,6 +63,12 @@ class RepoCore:
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=FULL")
             self._db.executescript(SCHEMA)
+            # Forward migration for volumes created before rollback support.
+            cols = {r[1] for r in self._db.execute("PRAGMA table_info(ops)")}
+            if "prev_digest" not in cols:
+                self._db.execute("ALTER TABLE ops ADD COLUMN prev_digest TEXT")
+            if "rolled_back" not in cols:
+                self._db.execute("ALTER TABLE ops ADD COLUMN rolled_back INTEGER NOT NULL DEFAULT 0")
             self._db.commit()
         # Fault-injection state (volatile, test-only).
         self.disconnected = False
@@ -145,10 +153,11 @@ class RepoCore:
                 bogus = hashlib.sha256(f"corrupt|{op_key}".encode()).hexdigest()
                 return new_receipt(self.name, "activate", op_key, bogus, self.secret), True
             receipt = new_receipt(self.name, "activate", op_key, digest, self.secret)
+            prev_digest = self._kv_get("active_digest")
             self._db.execute(
-                "INSERT INTO ops(op_key, op, digest, receipt, created_at)"
-                " VALUES(?,?,?,?,?)",
-                (op_key, "activate", digest, json.dumps(receipt), utcnow()),
+                "INSERT INTO ops(op_key, op, digest, receipt, created_at, prev_digest)"
+                " VALUES(?,?,?,?,?,?)",
+                (op_key, "activate", digest, json.dumps(receipt), utcnow(), prev_digest),
             )
             self._kv_set("active_digest", digest)
             self._kv_inc("activation_count")
@@ -165,6 +174,50 @@ class RepoCore:
                 "SELECT receipt FROM ops WHERE op_key=?", (op_key,)
             ).fetchone()
         return json.loads(row["receipt"]) if row else None
+
+    def rollback_activate(self, op_key: str) -> bool:
+        """Undo the activation committed under op_key.
+
+        Restores the active pointer captured immediately BEFORE that
+        activation (which may be None on a fresh volume). Idempotent: repeated
+        calls keep the same prior pointer, and a rollback never clobbers a
+        newer activation that superseded the undone digest. Returns True when
+        an activate op key was found and handled, False when nothing under
+        this key ever committed an activation (e.g. a forged fault receipt).
+        """
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM ops WHERE op_key=?", (op_key,)
+            ).fetchone()
+            if row is None or row["op"] != "activate":
+                return False
+            current = self._kv_get("active_digest")
+            if not row["rolled_back"]:
+                # The pointer is restored only while the undone activation is
+                # the one that owns it; a newer release must never be reverted.
+                if current == row["digest"]:
+                    self._restore_pointer(row["prev_digest"])
+                # The counter reflects committed, non-rolled-back activations.
+                count = int(self._kv_get("activation_count") or 0)
+                self._kv_set("activation_count", str(max(0, count - 1)))
+                self._db.execute(
+                    "UPDATE ops SET rolled_back=1 WHERE op_key=?", (op_key,)
+                )
+                self._db.commit()
+                return True
+            # Idempotent replay: re-assert the old pointer only while the
+            # undone digest is still active (never overwrite a newer release).
+            if current == row["digest"]:
+                self._restore_pointer(row["prev_digest"])
+                self._db.commit()
+            return True
+
+    def _restore_pointer(self, prev_digest: str | None) -> None:
+        """Call with the lock held."""
+        if prev_digest is None:
+            self._db.execute("DELETE FROM kv WHERE k=?", ("active_digest",))
+        else:
+            self._kv_set("active_digest", prev_digest)
 
     def state(self) -> dict:
         with self._lock:

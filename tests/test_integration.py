@@ -156,7 +156,8 @@ class IntegrationTests(unittest.TestCase):
     def test_foreign_digest_locks_rejection_and_preserves_pointer(self):
         self.post_release("rel-5", b"first")
         self.wait_state("rel-5", "COMPLETED")
-        before = self.repo_state(self.c.repo_b)
+        before_b = self.repo_state(self.c.repo_b)
+        before_a = self.repo_state(self.c.repo_a)
 
         http_json("POST", f"{self.c.repo_b.url}/fault/corrupt-next-activate", {}, timeout=5)
         self.post_release("rel-6", b"second")
@@ -164,15 +165,70 @@ class IntegrationTests(unittest.TestCase):
         self.assertIsNone(d["current_digest"])
         self.assertTrue(d["error"])
 
-        after = self.repo_state(self.c.repo_b)
-        self.assertEqual(after["active_digest"], before["active_digest"])
-        self.assertEqual(after["activation_count"], before["activation_count"])
+        after_b = self.repo_state(self.c.repo_b)
+        after_a = self.repo_state(self.c.repo_a)
+        # The misbehaving repo never moved; the OTHER repo must have rolled
+        # the rejected candidate back to its pre-release pointer.
+        self.assertEqual(after_b["active_digest"], before_b["active_digest"])
+        self.assertEqual(after_b["activation_count"], before_b["activation_count"])
+        self.assertEqual(after_a["active_digest"], before_a["active_digest"])
+        self.assertEqual(after_a["activation_count"], before_a["activation_count"])
+        self.assertNotEqual(after_a["active_digest"], sha(b"second"))
+        self.assertNotEqual(after_b["active_digest"], sha(b"second"))
 
         time.sleep(0.5)
         self.assertEqual(self.state_of("rel-6")["state"], "REJECTED")  # locked
         s, b = self.post_release("rel-6", b"second")
         self.assertEqual(s, 200)
         self.assertEqual(b["state"], "REJECTED")
+
+    def test_rejected_candidate_on_fresh_volume_leaves_both_pointers_null(self):
+        # Regression: on a brand-new volume repo-a activated the candidate
+        # before repo-b returned a foreign digest; the rejected SHA must not be
+        # left live on repo-a, and both pointers stay at their pre-release null.
+        before_a = self.repo_state(self.c.repo_a)
+        before_b = self.repo_state(self.c.repo_b)
+        self.assertIsNone(before_a["active_digest"])
+        self.assertIsNone(before_b["active_digest"])
+
+        http_json("POST", f"{self.c.repo_b.url}/fault/corrupt-next-activate", {}, timeout=5)
+        s, _ = self.post_release("rel-fresh-rej", b"candidate-on-empty-volume")
+        self.assertEqual(s, 202)
+        d = self.wait_state("rel-fresh-rej", "REJECTED")
+        self.assertIsNone(d["current_digest"])
+
+        artifact_sha = sha(b"candidate-on-empty-volume")
+        after_a = self.repo_state(self.c.repo_a)
+        after_b = self.repo_state(self.c.repo_b)
+        self.assertIsNone(after_a["active_digest"])
+        self.assertIsNone(after_b["active_digest"])
+        self.assertEqual(after_a["activation_count"], 0)
+        self.assertEqual(after_b["activation_count"], 0)
+        self.assertNotEqual(after_a["active_digest"], artifact_sha)
+        self.assertNotEqual(after_b["active_digest"], artifact_sha)
+
+        # Locked: stays REJECTED and never activates the rejected bytes later.
+        time.sleep(0.5)
+        self.assertEqual(self.state_of("rel-fresh-rej")["state"], "REJECTED")
+
+    def test_foreign_digest_on_first_repo_rolls_back_second_repo(self):
+        # Arm repo-a (the first repo the machine activates): the machine must
+        # still gather repo-b's honest activation, roll it back, then reject.
+        self.post_release("rel-base", b"base-payload")
+        self.wait_state("rel-base", "COMPLETED")
+        before_a = self.repo_state(self.c.repo_a)
+        before_b = self.repo_state(self.c.repo_b)
+
+        http_json("POST", f"{self.c.repo_a.url}/fault/corrupt-next-activate", {}, timeout=5)
+        self.post_release("rel-a-bad", b"new-payload")
+        self.wait_state("rel-a-bad", "REJECTED")
+
+        after_a = self.repo_state(self.c.repo_a)
+        after_b = self.repo_state(self.c.repo_b)
+        self.assertEqual(after_a["active_digest"], before_a["active_digest"])
+        self.assertEqual(after_b["active_digest"], before_b["active_digest"])
+        self.assertNotEqual(after_b["active_digest"], sha(b"new-payload"))
+        self.assertEqual(after_b["activation_count"], before_b["activation_count"])
 
     def test_restart_converges_from_repo_receipts(self):
         http_json("POST", f"{self.c.repo_b.url}/fault/disconnect-after-activate", {}, timeout=5)
