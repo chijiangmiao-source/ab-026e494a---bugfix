@@ -46,8 +46,11 @@ CONTROL_PORT=9090 docker compose up --build -d control repo-a repo-b
 - **断连收敛**：若一仓在持久化激活后断开响应，控制服务重启后会先向仓端
   `GET /v1/ops/{op_key}` 认领既有回执，依据仓端回执收敛为完成，绝不二次激活。
 - **拒绝锁定**：任一仓返回不属于该发布的摘要（或证据签名不符、操作键冲突）时，
-  发布锁定为 `REJECTED`，`current_digest` 保持为空，仓端活动指针不被改写，
-  且状态不再漂移。
+  发布先进入收敛中的 `REJECTING`：控制服务对两仓分别下发幂等的 `rollback`，把已
+  翻转的活动指针精确还原为该发布激活前的值（新仓还原为 `null`，不增加激活计数，
+  从未激活的仓为无操作）。两仓回滚均收敛（或经仓端回执确认无需回滚）后才锁定为
+  `REJECTED`，`current_digest` 保持为空，被拒绝的工件不会成为任一仓的活动版本，
+  且状态不再漂移；控制服务在 `REJECTING` 期间重启也会从仓端回执继续收敛。
 - **幂等提交**：相同标识 + 相同工件 → `200` 回放当前状态，不产生第二次激活；
   相同标识 + 不同工件 → `409 release_id_in_use`，既有成功发布的真实状态保留；
   非法 Base64 → `400 invalid_base64`；超限工件 → `413 artifact_too_large`
@@ -63,7 +66,7 @@ CONTROL_PORT=9090 docker compose up --build -d control repo-a repo-b
 | GET | `/api/releases/{id}` | 进度、当前摘要、双仓准备/激活证据（签名回执） |
 | GET | `/api/releases` | 全部发布列表 |
 
-仓端（仅内部网络）：`POST /v1/prepare`、`POST /v1/activate`、
+仓端（仅内部网络）：`POST /v1/prepare`、`POST /v1/activate`、`POST /v1/rollback`、
 `GET /v1/ops/{op_key}`、`GET /v1/state`、`GET /healthz`。
 
 ## verify 验收服务

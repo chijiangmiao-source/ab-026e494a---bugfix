@@ -264,6 +264,10 @@ def phase_smoke(rid: str, artifact: bytes, sha: str):
     # Rejection: a repo returns a digest that does not belong to the release.
     rid3 = f"{rid}-rej"
     art3 = f"rejection-probe:{rid3}".encode()
+    art3_sha = sha256_hex(art3)
+    # Snapshot BOTH repos: a rejected candidate must never remain active on
+    # the repo that flipped before the other repo misbehaved.
+    a_state_before = repo_state(REPO_A_URL)
     b_state_before = repo_state(REPO_B_URL)
     s, _ = http_json("POST", f"{REPO_B_URL}/fault/corrupt-next-activate", {}, timeout=5)
     check("arm repo-b corrupt-next-activate", s == 200, f"status={s}")
@@ -280,10 +284,17 @@ def phase_smoke(rid: str, artifact: bytes, sha: str):
     check("rejection reason recorded", bool(d3.get("error")), f"error={d3.get('error')}")
     check("rejected release exposes no current digest",
           d3.get("current_digest") is None, f"current={d3.get('current_digest')}")
+    a_state_after = repo_state(REPO_A_URL)
     b_state_after = repo_state(REPO_B_URL)
-    check("repo-b active pointer NOT rewritten",
-          b_state_after.get("active_digest") == b_state_before.get("active_digest"),
-          f"active={b_state_after.get('active_digest')}")
+    for name, before, after in (
+        ("repo-a", a_state_before, a_state_after),
+        ("repo-b", b_state_before, b_state_after),
+    ):
+        check(f"{name} active pointer preserved after rejection",
+              after.get("active_digest") == before.get("active_digest"),
+              f"before={before.get('active_digest')} after={after.get('active_digest')}")
+        check(f"{name} rejected artifact never became the active digest",
+              after.get("active_digest") != art3_sha, f"active={after.get('active_digest')}")
     check("repo-b did not register an activation for the rejected release",
           b_state_after.get("activation_count") == b_state_before.get("activation_count"))
     time.sleep(3)

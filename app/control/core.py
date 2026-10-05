@@ -14,12 +14,14 @@ RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 STATE_PENDING = "PENDING"
 STATE_PREPARING = "PREPARING"
 STATE_ACTIVATING = "ACTIVATING"
+STATE_REJECTING = "REJECTING"  # rejection decided; rolling back any activations
 STATE_COMPLETED = "COMPLETED"
 STATE_REJECTED = "REJECTED"
 TERMINAL_STATES = (STATE_COMPLETED, STATE_REJECTED)
 
 OP_PREPARE = "prepare"
 OP_ACTIVATE = "activate"
+OP_ROLLBACK = "rollback"
 
 
 class ValidationError(Exception):

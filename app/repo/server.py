@@ -13,6 +13,7 @@ from app.common.httpjson import ApiError, App, make_server
 from app.repo.core import (
     Conflict,
     DisconnectedAfterCommit,
+    NothingToRollback,
     NotPrepared,
     RepoCore,
 )
@@ -82,6 +83,20 @@ def build_app(core: RepoCore, fault_hooks: bool = False) -> App:
             # The activation IS committed; only the response is dropped.
             raise ApiError(503, "disconnected", "镜像仓已断开响应")
         return (201 if created else 200), {"receipt": receipt}
+
+    @app.route("POST", "/v1/rollback")
+    def rollback(req):
+        guard()
+        body = req.json()
+        op_key = body.get("op_key")
+        if not (isinstance(op_key, str) and op_key):
+            raise ApiError(400, "bad_request", "op_key 为必填字符串")
+        try:
+            receipt, created = core.rollback(op_key)
+        except NothingToRollback:
+            # The repo never activated under this key: there is nothing to undo.
+            return 200, {"rolled_back": False}
+        return (201 if created else 200), {"rolled_back": True, "receipt": receipt}
 
     @app.route("GET", "/v1/ops/{op_key}")
     def get_op(req):

@@ -4,7 +4,13 @@ import tempfile
 import unittest
 
 from app.common.receipts import verify_receipt
-from app.repo.core import Conflict, DisconnectedAfterCommit, NotPrepared, RepoCore
+from app.repo.core import (
+    Conflict,
+    DisconnectedAfterCommit,
+    NothingToRollback,
+    NotPrepared,
+    RepoCore,
+)
 
 
 def sha(b: bytes) -> str:
@@ -94,6 +100,51 @@ class RepoCoreTests(unittest.TestCase):
         self.assertIsNone(state["active_digest"])
         self.assertEqual(state["activation_count"], 0)
         self.assertIsNone(self.core.get_op("ka"))  # nothing persisted
+
+    def test_rollback_restores_null_pointer_on_a_fresh_repo(self):
+        self.core.prepare("kp", sha(b"x"), b"x")
+        self.core.activate("ka", sha(b"x"))
+        self.assertEqual(self.core.state()["active_digest"], sha(b"x"))
+
+        r1, created = self.core.rollback("ka")
+        self.assertTrue(created)
+        self.assertTrue(verify_receipt("secret-a", r1))
+        state = self.core.state()
+        self.assertIsNone(state["active_digest"])  # restored to pre-release NULL
+        self.assertEqual(state["activation_count"], 1)  # rollback is not an activation
+
+        # Idempotent: replays the first rollback receipt, no second pointer flip.
+        r2, created = self.core.rollback("ka")
+        self.assertFalse(created)
+        self.assertEqual(r1["receipt_id"], r2["receipt_id"])
+        self.assertIsNone(self.core.state()["active_digest"])
+        self.assertEqual(self.core.state()["activation_count"], 1)
+
+    def test_rollback_restores_previous_non_null_pointer(self):
+        self.core.prepare("kp0", sha(b"base"), b"base")
+        self.core.activate("ka0", sha(b"base"))
+        self.core.prepare("kp1", sha(b"x"), b"x")
+        self.core.activate("ka1", sha(b"x"))
+        self.assertEqual(self.core.state()["active_digest"], sha(b"x"))
+
+        self.core.rollback("ka1")
+        state = self.core.state()
+        self.assertEqual(state["active_digest"], sha(b"base"))  # previous live version
+        self.assertEqual(state["activation_count"], 2)
+
+    def test_rollback_without_an_activation_is_a_noop(self):
+        with self.assertRaises(NothingToRollback):
+            self.core.rollback("never-activated")
+
+    def test_prev_pointer_recorded_survives_reopen(self):
+        self.core.prepare("kp0", sha(b"base"), b"base")
+        self.core.activate("ka0", sha(b"base"))
+        self.core.prepare("kp1", sha(b"x"), b"x")
+        self.core.activate("ka1", sha(b"x"))
+        self.core.close()
+        self.core = RepoCore(os.path.join(self.dir.name, "repo.db"), "repo-a", "secret-a")
+        self.core.rollback("ka1")
+        self.assertEqual(self.core.state()["active_digest"], sha(b"base"))
 
 
 if __name__ == "__main__":

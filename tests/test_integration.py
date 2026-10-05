@@ -9,7 +9,10 @@ import urllib.parse
 
 from app.common.httpjson import http_json
 from app.control.core import op_key
+from app.control.machine import ReleaseMachine
+from app.control.repos import RepoClient
 from app.control.server import ControlService
+from app.control.store import Store
 from app.repo.server import RepoService
 
 
@@ -174,6 +177,73 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(s, 200)
         self.assertEqual(b["state"], "REJECTED")
 
+    def test_rejected_release_never_becomes_active_on_any_repo(self):
+        # Exact regression: a brand-new cluster has NULL active pointers.
+        # repo-b returns a signed-but-foreign activate receipt; repo-a had
+        # already flipped. After REJECTED both repos must keep their prior
+        # pointer and the rejected artifact must be active nowhere.
+        artifact = b"rejected-candidate-bytes"
+        art_sha = sha(artifact)
+        before_a = self.repo_state(self.c.repo_a)
+        before_b = self.repo_state(self.c.repo_b)
+        self.assertIsNone(before_a["active_digest"])
+        self.assertIsNone(before_b["active_digest"])
+
+        s, _ = http_json("POST", f"{self.c.repo_b.url}/fault/corrupt-next-activate",
+                         {}, timeout=5)
+        self.assertEqual(s, 200)
+        self.post_release("rel-rej-fresh", artifact)
+
+        def rejected():
+            d = self.state_of("rel-rej-fresh")
+            return d if d.get("state") == "REJECTED" else None
+
+        d = wait_for(rejected)
+        self.assertIsNone(d["current_digest"])
+
+        after_a = self.repo_state(self.c.repo_a)
+        after_b = self.repo_state(self.c.repo_b)
+        # Pointers preserved on BOTH repos ...
+        self.assertEqual(after_a["active_digest"], before_a["active_digest"])
+        self.assertEqual(after_b["active_digest"], before_b["active_digest"])
+        # ... and never equal the rejected artifact's digest.
+        self.assertNotEqual(after_a["active_digest"], art_sha)
+        self.assertNotEqual(after_b["active_digest"], art_sha)
+        # repo-a's activation was rolled back, not counted as a live activation
+        # of the rejected candidate: its pointer is back at NULL.
+        self.assertIsNone(after_a["active_digest"])
+        self.assertIsNone(after_b["active_digest"])
+
+        # Locked: no later tick flips either pointer.
+        time.sleep(0.5)
+        self.assertEqual(self.state_of("rel-rej-fresh")["state"], "REJECTED")
+        self.assertIsNone(self.repo_state(self.c.repo_a)["active_digest"])
+        self.assertIsNone(self.repo_state(self.c.repo_b)["active_digest"])
+
+    def test_rejected_release_after_a_good_one_rolls_both_back(self):
+        # Both repos already serve a live release; a rejected follow-up must
+        # leave every pointer at the previous live version, not the candidate.
+        self.post_release("rel-good", b"good-artifact")
+        self.wait_state("rel-good", "COMPLETED")
+        good_sha = sha(b"good-artifact")
+        before_a = self.repo_state(self.c.repo_a)
+        before_b = self.repo_state(self.c.repo_b)
+        self.assertEqual(before_a["active_digest"], good_sha)
+        self.assertEqual(before_b["active_digest"], good_sha)
+
+        candidate = b"bad-followup-artifact"
+        http_json("POST", f"{self.c.repo_b.url}/fault/corrupt-next-activate", {}, timeout=5)
+        self.post_release("rel-bad-followup", candidate)
+        wait_for(lambda: self.state_of("rel-bad-followup").get("state") == "REJECTED")
+
+        after_a = self.repo_state(self.c.repo_a)
+        after_b = self.repo_state(self.c.repo_b)
+        self.assertEqual(after_a["active_digest"], before_a["active_digest"])
+        self.assertEqual(after_b["active_digest"], before_b["active_digest"])
+        self.assertNotEqual(after_a["active_digest"], sha(candidate))
+        self.assertNotEqual(after_b["active_digest"], sha(candidate))
+
+
     def test_restart_converges_from_repo_receipts(self):
         http_json("POST", f"{self.c.repo_b.url}/fault/disconnect-after-activate", {}, timeout=5)
         s, _ = self.post_release("rel-7", b"third")
@@ -209,6 +279,41 @@ class IntegrationTests(unittest.TestCase):
         s, b = http_json("GET", f"{self.c.repo_b.url}/v1/ops/{key}", timeout=5)
         self.assertEqual(b["receipt"]["receipt_id"],
                          d["repos"]["repo-b"]["activate"]["receipt_id"])
+
+    def test_restart_during_rejection_converges_rollback(self):
+        # Drive the machine directly so we can crash control right after the
+        # rejection decision, before rollback converges. repo-a has already
+        # activated (flipping its pointer); the fresh control process must
+        # roll it back on restart and only then lock REJECTED.
+        root = self.c.dir.name
+        ctl_dir = os.path.join(root, "ctl-reject-restart")
+        store = Store(os.path.join(ctl_dir, "control.db"))
+        clients = {
+            "repo-a": RepoClient("repo-a", self.c.repo_a.url, timeout=2.0),
+            "repo-b": RepoClient("repo-b", self.c.repo_b.url, timeout=2.0),
+        }
+        secrets = {"repo-a": "s-a", "repo-b": "s-b"}
+        machine = ReleaseMachine(store, clients, secrets)
+
+        rid, art = "rel-crash-reject", b"crash-reject-artifact"
+        http_json("POST", f"{self.c.repo_b.url}/fault/corrupt-next-activate", {}, timeout=5)
+        store.insert_release(rid, sha(art), art, "PENDING")
+        machine.advance(rid)  # rejection decision parks as REJECTING, no lock yet
+        self.assertEqual(store.get_release(rid)["state"], "REJECTING")
+        # repo-a flipped before repo-b returned the foreign receipt ...
+        self.assertEqual(self.repo_state(self.c.repo_a)["active_digest"], sha(art))
+
+        # ... a brand-new control process resumes from durable state ...
+        store.close()
+        store2 = Store(os.path.join(ctl_dir, "control.db"))
+        machine2 = ReleaseMachine(store2, clients, secrets)
+        machine2.advance(rid)
+        self.assertEqual(store2.get_release(rid)["state"], "REJECTED")
+
+        # ... and leaves the rejected candidate active on neither repo.
+        self.assertIsNone(self.repo_state(self.c.repo_a)["active_digest"])
+        self.assertIsNone(self.repo_state(self.c.repo_b)["active_digest"])
+        store2.close()
 
     def test_health_and_console_page(self):
         s, b = http_json("GET", f"{self.c.control.url}/healthz", timeout=5)

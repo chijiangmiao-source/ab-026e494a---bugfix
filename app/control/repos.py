@@ -32,5 +32,13 @@ class RepoClient:
             timeout=self.timeout,
         )
 
+    def rollback(self, op_key: str):
+        return http_json(
+            "POST",
+            f"{self.base_url}/v1/rollback",
+            {"op_key": op_key},
+            timeout=self.timeout,
+        )
+
     def state(self):
         return http_json("GET", f"{self.base_url}/v1/state", timeout=self.timeout)
